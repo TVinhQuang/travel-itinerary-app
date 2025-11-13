@@ -3,12 +3,385 @@ import streamlit as st
 import pyrebase
 import firebase_admin
 import requests
+from dataclasses import dataclass
+from typing import List
+import math
+import random
+from geopy.geocoders import Nominatim
 from firebase_admin import credentials, firestore
 from firebase_admin import auth as admin_auth
 from collections import deque
 from datetime import datetime, timezone
 from ollama import Client
 from streamlit_extras.stylable_container import stylable_container
+
+# ===================== MÔ-ĐUN THUẬT TOÁN GỢI Ý NƠI Ở =====================
+
+@dataclass
+class Accommodation:
+    """
+    Đại diện cho 1 nơi ở sau khi đã nạp từ API OpenStreetMap/Overpass.
+    (price, rating hiện tại có thể là giá trị giả lập trong bản demo.)
+    """
+    id: str
+    name: str
+    city: str
+    type: str           # hotel / hostel / apartment / ...
+    price: float        # giá ước lượng VND/đêm
+    stars: float        # 0–5
+    rating: float       # 0–10
+    capacity: int       # sức chứa tối đa
+    amenities: List[str]
+    address: str
+    lon: float
+    lat: float
+    distance_km: float  # khoảng cách tới tâm thành phố (km)
+
+
+@dataclass
+class SearchQuery:
+    """
+    Gói toàn bộ input người dùng cho thuật toán gợi ý.
+    Sau này ta sẽ build SearchQuery từ form trên web.
+    """
+    city: str                      # tên thành phố điểm đến
+    group_size: int                # số người
+    price_min: float               # ngân sách tối thiểu (cho 1 đêm)
+    price_max: float               # ngân sách tối đa
+    types: List[str]               # loại chỗ ở mong muốn: ["hotel","homestay",...]
+    rating_min: float              # rating tối thiểu (0–10)
+    amenities_required: List[str]  # tiện ích bắt buộc (phải có)
+    amenities_preferred: List[str] # tiện ích ưu tiên (có thì cộng điểm)
+    radius_km: float               # bán kính tìm kiếm quanh thành phố (km)
+
+def filter_by_constraints(accommodations: List[Accommodation], q: SearchQuery) -> List[Accommodation]:
+    """
+    Lọc danh sách nơi ở theo các ràng buộc cứng:
+    - Khoảng giá
+    - Sức chứa
+    - Loại chỗ ở
+    - Rating tối thiểu
+    - Tiện ích bắt buộc
+
+    Nếu không thỏa một điều kiện nào thì nơi ở đó bị loại luôn.
+    """
+    filtered: List[Accommodation] = []
+
+    for a in accommodations:
+        # 1. Giá: nằm trong [price_min, price_max]
+        if a.price < q.price_min or a.price > q.price_max:
+            continue
+
+        # 2. Sức chứa: phải đủ cho group_size
+        if a.capacity < q.group_size:
+            continue
+
+        # 3. Loại chỗ ở: nếu user chọn types thì phải match 1 trong các loại đó
+        if q.types and (a.type not in q.types):
+            continue
+
+        # 4. Rating tối thiểu (0–10)
+        if a.rating < q.rating_min:
+            continue
+
+        # 5. Tiện ích bắt buộc: mỗi tiện ích required phải có trong a.amenities
+        if any(req.lower() not in [am.lower() for am in a.amenities] for req in q.amenities_required):
+            continue
+
+        filtered.append(a)
+
+    return filtered
+
+def clamp01(x: float) -> float:
+    """Giới hạn giá trị trong [0,1] để tránh <0 hoặc >1."""
+    return max(0.0, min(1.0, x))
+
+#mô-đun “Scoring & Ranking module”
+def score_accommodation(a: Accommodation, q: SearchQuery) -> float:
+    """
+    Tính điểm xếp hạng cho 1 nơi ở theo nhiều tiêu chí.
+
+    - S_price  : 1 nếu giá gần mức mong muốn, 0 nếu chênh lệch quá lớn.
+    - S_stars  : sao / 5.
+    - S_rating : rating / 10.
+    - S_amen   : tỉ lệ tiện ích yêu cầu + ưu tiên được đáp ứng.
+    - S_dist   : càng gần tâm city (so với bán kính radius_km) thì điểm càng cao.
+
+    Tổng hợp: 
+    Score = 0.25*S_price + 0.20*S_stars + 0.25*S_rating + 0.20*S_amen + 0.10*S_dist
+    """
+
+    # ----- 1. Điểm GIÁ -----
+    Pmin, Pmax = q.price_min, q.price_max
+    if Pmax > Pmin:
+        Pc = (Pmin + Pmax) / 2.0                  # giá mục tiêu ở giữa khoảng
+        denom = max(1.0, (Pmax - Pmin) / 2.0)     # "nửa khoảng" để chuẩn hoá
+        S_price = 1.0 - min(abs(a.price - Pc) / denom, 1.0)
+    else:
+        # Nếu user không đặt khoảng giá rõ ràng, cho tất cả = 1
+        S_price = 1.0
+
+    # ----- 2. Điểm SAO & RATING -----
+    S_stars = clamp01(a.stars / 5.0)       # 0–5 sao -> 0–1
+    S_rating = clamp01(a.rating / 10.0)    # 0–10 rating -> 0–1
+
+    # ----- 3. Điểm TIỆN ÍCH -----
+    have = set(x.lower() for x in a.amenities)
+    req = set(x.lower() for x in q.amenities_required)
+    pref = set(x.lower() for x in q.amenities_preferred)
+
+    if req or pref:
+        match_req = len(have.intersection(req))
+        match_pref = len(have.intersection(pref))
+
+        # required trọng số 1.0, preferred trọng số 0.5
+        matched_score = match_req + 0.5 * match_pref
+        max_possible = max(1.0, len(req) + 0.5 * len(pref))
+        S_amen = matched_score / max_possible
+    else:
+        S_amen = 1.0  # user không yêu cầu tiện ích gì đặc biệt
+
+    # ----- 4. Điểm KHOẢNG CÁCH -----
+    # distance_km: khoảng cách tới tâm thành phố; so với radius_km
+    if q.radius_km > 0:
+        S_dist = 1.0 - min(a.distance_km / q.radius_km, 1.0)
+    else:
+        S_dist = 1.0
+
+    # ----- 5. Tổng hợp điểm (có thể chỉnh các trọng số này nếu cần) -----
+    score = (
+        0.25 * S_price +
+        0.20 * S_stars +
+        0.25 * S_rating +
+        0.20 * S_amen +
+        0.10 * S_dist
+    )
+
+    return score
+
+def rank_accommodations(accommodations: List[Accommodation], q: SearchQuery, top_k: int = 5):
+    """
+    Thực hiện:
+    - Lọc theo constraints (hard filter).
+    - Tính score cho từng nơi ở.
+    - Sắp xếp giảm dần theo score và lấy Top K.
+
+    Trả về list các dict:
+        { "score": float, "accommodation": Accommodation }
+    để phần UI dễ render.
+    """
+    # 1. Lọc theo ràng buộc cứng
+    filtered = filter_by_constraints(accommodations, q)
+
+    if not filtered:
+        return []
+
+    # 2. Tính điểm cho từng nơi
+    scored = []
+    for a in filtered:
+        s = score_accommodation(a, q)
+        scored.append({
+            "score": s,
+            "accommodation": a,
+        })
+
+    # 3. Sắp xếp giảm dần theo score, nếu bằng nhau thì ưu tiên rating cao hơn
+    scored.sort(
+        key=lambda item: (item["score"], item["accommodation"].rating),
+        reverse=True
+    )
+
+    # 4. Lấy Top-K
+    return scored[:top_k]
+def haversine_km(lon1, lat1, lon2, lat2):
+    """
+    Tính khoảng cách đường tròn lớn giữa 2 điểm (lat, lon) trên Trái đất, đơn vị km.
+    Dùng công thức Haversine.
+    """
+    R = 6371.0  # bán kính Trái đất (km)
+
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    dphi = phi2 - phi1
+    dlambda = math.radians(lon2 - lon1)
+
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
+    c = 2 * math.asin(math.sqrt(a))
+
+    return R * c
+
+def geocode_city(city_name: str):
+    """
+    Dùng Nominatim để lấy toạ độ (lat, lon) của một thành phố.
+    Trả về dict {"name", "lat", "lon"} hoặc None nếu lỗi.
+    """
+    geocoder = Nominatim(user_agent="smart_tourism_demo")
+    try:
+        loc = geocoder.geocode(city_name, exactly_one=True, addressdetails=True, language="en")
+        if not loc:
+            return None
+        return {
+            "name": loc.address,
+            "lat": loc.latitude,
+            "lon": loc.longitude,
+        }
+    except Exception:
+        return None
+
+OVERPASS_URL = "https://overpass-api.de/api/interpreter"
+
+
+def fetch_osm_accommodations(city_name: str, radius_km: float = 5.0, max_results: int = 50):
+    """
+    Gọi OpenStreetMap (Overpass API) để lấy danh sách nơi ở quanh một thành phố.
+
+    Bước:
+    1) Geocode tên thành phố -> (lat_city, lon_city)
+    2) Dùng Overpass query lấy các node/way/relation có tourism=hotel|hostel|guest_house|apartment
+       trong bán kính radius_km quanh city.
+    3) Convert về list[Accommodation], trong đó:
+       - price, rating, capacity, amenities được GIẢ LẬP từ sao + một số tag.
+    """
+
+    # ----- 1. Geocode city -----
+    city_geo = geocode_city(f"{city_name}, Vietnam")
+    if not city_geo:
+        return [], None  # không tìm được city
+
+    city_lat = city_geo["lat"]
+    city_lon = city_geo["lon"]
+    radius_m = int(radius_km * 1000)
+
+    # ----- 2. Overpass query -----
+    # Lấy các đối tượng có tourism là hotel, hostel, guest_house hoặc apartment
+    query = f"""
+    [out:json][timeout:25];
+    (
+      node["tourism"~"hotel|hostel|guest_house|apartment"](around:{radius_m},{city_lat},{city_lon});
+      way["tourism"~"hotel|hostel|guest_house|apartment"](around:{radius_m},{city_lat},{city_lon});
+      relation["tourism"~"hotel|hostel|guest_house|apartment"](around:{radius_m},{city_lat},{city_lon});
+    );
+    out center {max_results};
+    """
+
+    resp = requests.post(OVERPASS_URL, data=query)
+    resp.raise_for_status()
+    data = resp.json()
+
+    elements = data.get("elements", [])
+    accommodations: list[Accommodation] = []
+
+    # ----- 3. Duyệt kết quả Overpass & convert -> Accommodation -----
+    for el in elements:
+        tags = el.get("tags", {})
+
+        # Lấy lat, lon: node có sẵn; way/relation dùng 'center'
+        if el["type"] == "node":
+            lat = el.get("lat")
+            lon = el.get("lon")
+        else:
+            center = el.get("center") or {}
+            lat = center.get("lat")
+            lon = center.get("lon")
+
+        if lat is None or lon is None:
+            continue  # bỏ qua nếu không có toạ độ
+
+        # Tên chỗ ở
+        name = tags.get("name", "Chỗ ở không tên")
+
+        # Thành phố: ưu tiên addr:city, fallback dùng city_name user nhập
+        city = tags.get("addr:city", city_name)
+
+        # Loại chỗ ở
+        tourism_type = tags.get("tourism", "hotel")  # hotel / hostel / guest_house / apartment
+        # Quy ước type đơn giản cho thuật toán
+        if tourism_type == "guest_house":
+            acc_type = "homestay"
+        elif tourism_type == "apartment":
+            acc_type = "apartment"
+        elif tourism_type == "hostel":
+            acc_type = "hostel"
+        else:
+            acc_type = "hotel"
+
+        # Số sao (nếu OSM có tag 'stars'), mặc định 3
+        try:
+            stars = float(tags.get("stars", 3))
+        except ValueError:
+            stars = 3.0
+
+        # GIẢ LẬP GIÁ dựa trên số sao (cho phù hợp thuật toán)
+        base_by_star = {1: 300_000, 2: 450_000, 3: 700_000, 4: 1_000_000, 5: 1_500_000}
+        base_price = base_by_star.get(int(stars), 700_000)
+        # random nhẹ  ±10% cho giống thật
+        price = base_price * (0.9 + 0.2 * random.random())
+
+        # GIẢ LẬP RATING 7.0–10.0
+        rating = 7.0 + 3.0 * random.random()
+
+        # GIẢ LẬP SỨC CHỨA (cho đơn giản: 2–6 người)
+        capacity = 2 + int(random.random() * 4)
+
+        # Tiện ích: map từ một số tag OSM cơ bản
+        amenities = []
+        internet = tags.get("internet_access")
+        if internet in ("wlan", "yes"):
+            amenities.append("wifi")
+        if tags.get("parking") == "yes":
+            amenities.append("parking")
+        if tags.get("breakfast") == "yes":
+            amenities.append("breakfast")
+        if tags.get("swimming_pool") == "yes":
+            amenities.append("pool")
+
+        # Địa chỉ hiển thị
+        address = tags.get("addr:full") or tags.get("addr:street") or tags.get("addr:housenumber") or city
+
+        # Khoảng cách tới tâm city (km)
+        distance_km = haversine_km(city_lon, city_lat, lon, lat)
+
+        acc = Accommodation(
+            id=str(el.get("id")),
+            name=name,
+            city=city,
+            type=acc_type,
+            price=price,
+            stars=stars,
+            rating=rating,
+            capacity=capacity,
+            amenities=amenities,
+            address=address,
+            lon=lon,
+            lat=lat,
+            distance_km=distance_km,
+        )
+        accommodations.append(acc)
+
+    return accommodations, (city_lon, city_lat)
+
+def recommend_top5_from_api(q: SearchQuery):
+    """
+    Hàm tiện dụng:
+    - Dùng city & radius trong SearchQuery để gọi Overpass lấy danh sách nơi ở.
+    - Dùng rank_accommodations(...) để lọc + chấm điểm + lấy Top 5.
+
+    Trả về:
+      - danh sách top-5 (mỗi phần tử là dict {score, accommodation})
+      - toạ độ tâm city (lon, lat) để sau này vẽ map
+    """
+    accommodations, city_center = fetch_osm_accommodations(
+        city_name=q.city,
+        radius_km=q.radius_km,
+        max_results=50,
+    )
+
+    if not accommodations:
+        return [], city_center
+
+    top5 = rank_accommodations(accommodations, q, top_k=5)
+    return top5, city_center
+
 
 st.set_page_config(page_title="Tourism_Symstem", page_icon="💬")
 MODEL = "llama3.2:1b"
@@ -122,6 +495,11 @@ else:
 
 if "chat_open" not in st.session_state:
     st.session_state.chat_open = False
+
+# Lưu kết quả gợi ý nơi ở (Top 5 + thông tin city center) để hiển thị sau
+if "accommodation_results" not in st.session_state:
+    st.session_state.accommodation_results = None
+
 
 def login_form():
     st.markdown("<h3 style='text-align: center;'>Đăng nhập</h3>", unsafe_allow_html=True)
@@ -254,103 +632,138 @@ if st.session_state.user:
             st.session_state.chat_open = False
             st.rerun()
 
-# --- Bắt đầu: Phần thêm mới cho Lịch trình Du lịch ---
+# --- Bắt đầu: Phần Gợi ý Nơi Ở ---
 
-# Chỉ hiển thị giao diện tạo lịch trình khi người dùng đã đăng nhập
+# Chỉ hiển thị giao diện gợi ý nơi ở khi người dùng đã đăng nhập
 if st.session_state.user:
-    st.markdown("## ✈️ Tạo Lịch Trình Du Lịch")
+    st.markdown("## 🏨 Gợi ý Nơi Ở Phù Hợp")
 
-    with st.form("travel_form"):
-        # 1. Thành phố xuất phát & Điểm đến
-        col_city_1, col_city_2 = st.columns(2)
-        with col_city_1:
-            origin_city = st.text_input("Thành phố Xuất phát (Origin City)", value="Hà Nội")
-        with col_city_2:
-            destination_city = st.text_input("Thành phố Điểm đến (Destination City)", value="Đà Nẵng")
+    with st.form("accommodation_form"):
+        st.write("Nhập nhu cầu nơi ở, hệ thống sẽ gợi ý Top 5 địa điểm phù hợp nhất xung quanh thành phố điểm đến (dữ liệu từ OpenStreetMap).")
 
-        # 2. Ngày tháng
-        col_date_1, col_date_2 = st.columns(2)
-        with col_date_1:
-            start_date = st.date_input("Ngày Bắt đầu", datetime.now().date())
-        with col_date_2:
-            # Ngày kết thúc phải sau ngày bắt đầu
-            end_date = st.date_input("Ngày Kết thúc", datetime.now().date())
+        # 1. Thành phố điểm đến
+        acc_city = st.text_input("Thành phố Điểm đến", value="Đà Nẵng")
 
-        # 3. Sở thích và Tốc độ
-        col_interest, col_pace = st.columns(2)
-        with col_interest:
-            interests = st.multiselect(
-                "Sở thích (Interests)",
-                ['food', 'museums', 'nature', 'nightlife'],
-                default=['food', 'nature'],
-                placeholder="Chọn ít nhất một sở thích"
+        # 2. Số người
+        group_size = st.number_input("Số người", min_value=1, max_value=20, value=2, step=1)
+
+        # 3. Khoảng giá (tính theo 1 đêm, VND)
+        col_price_1, col_price_2 = st.columns(2)
+        with col_price_1:
+            price_min = st.number_input(
+                "Giá tối thiểu mỗi đêm (VND)",
+                min_value=0,
+                value=300_000,
+                step=50_000
             )
-        with col_pace:
-            pace = st.radio(
-                "Tốc độ (Pace)",
-                ['relaxed', 'normal', 'tight'],
-                index=1,
-                horizontal=True
+        with col_price_2:
+            price_max = st.number_input(
+                "Giá tối đa mỗi đêm (VND)",
+                min_value=0,
+                value=1_500_000,
+                step=50_000
             )
-               
-        # Nút tạo lịch trình
-        submit_button = st.form_submit_button("Lên Lịch Trình! 🗺️", type="primary")
 
-# ... (ở cuối khối st.form("travel_form")) ...
+        # 4. Loại hình nơi ở
+        types = st.multiselect(
+            "Loại hình nơi ở",
+            options=["hotel", "homestay", "hostel", "apartment"],
+            default=["hotel", "homestay"]
+        )
 
-        if submit_button:
-            if not origin_city or not destination_city or not interests:
-                st.error("Vui lòng nhập đầy đủ Thành phố Xuất phát, Điểm đến và Sở thích.")
-            elif start_date > end_date:
-                st.error("Ngày Kết thúc phải sau Ngày Bắt đầu.")
+        # 5. Rating tối thiểu & Bán kính tìm kiếm
+        col_rating, col_radius = st.columns(2)
+        with col_rating:
+            rating_min = st.slider("Rating tối thiểu", 0.0, 10.0, 7.5, 0.5)
+        with col_radius:
+            radius_km = st.slider("Bán kính tìm kiếm quanh thành phố (km)", 1.0, 20.0, 5.0, 1.0)
+
+        # 6. Tiện ích bắt buộc & ưu tiên
+        amenities_required = st.multiselect(
+            "Tiện ích BẮT BUỘC phải có",
+            options=["wifi", "breakfast", "pool", "parking"],
+            default=["wifi"]
+        )
+
+        amenities_preferred = st.multiselect(
+            "Tiện ích ƯU TIÊN (có thì tốt)",
+            options=["wifi", "breakfast", "pool", "parking"],
+            default=["breakfast", "pool"]
+        )
+
+        submit_acc = st.form_submit_button("🔍 Gợi ý Top 5 nơi ở")
+
+        # ===== XỬ LÝ KHI NHẤN NÚT GỢI Ý =====
+        if submit_acc:
+            if not acc_city.strip():
+                st.error("Vui lòng nhập Thành phố Điểm đến.")
+            elif price_min > 0 and price_max > 0 and price_min > price_max:
+                st.error("Giá tối thiểu phải nhỏ hơn hoặc bằng giá tối đa.")
             else:
-                # 1. Xây dựng Prompt
-                duration = (end_date - start_date).days + 1
+                # Tạo SearchQuery từ input người dùng
+                q = SearchQuery(
+                    city=acc_city.strip(),
+                    group_size=int(group_size),
+                    price_min=float(price_min),
+                    price_max=float(price_max),
+                    types=types,
+                    rating_min=float(rating_min),
+                    amenities_required=amenities_required,
+                    amenities_preferred=amenities_preferred,
+                    radius_km=float(radius_km),
+                )
 
-                prompt_template = f"""
-                Bạn là một trợ lý du lịch chuyên nghiệp. Hãy tạo một lịch trình du lịch {duration} ngày
-                cho chuyến đi từ {origin_city} đến {destination_city}.
-
-                Thông tin chi tiết:
-                - **Ngày đi:** Từ {start_date.strftime('%d/%m/%Y')} đến {end_date.strftime('%d/%m/%Y')}
-                - **Sở thích chính:** {', '.join(interests)}
-                - **Tốc độ:** {pace}
-
-                Lịch trình phải được trình bày theo định dạng từng ngày, bao gồm các hoạt động/địa điểm cho buổi **Sáng**, **Chiều**, và **Tối**, kèm theo **giải thích ngắn gọn** tại sao nên chọn hoạt động đó. Lịch trình phải bằng tiếng Việt.
-                """
-
-                # 2. Gọi LLM
-                with st.spinner('Đang tạo lịch trình chi tiết...'):
+                with st.spinner("Đang tìm kiếm và xếp hạng các nơi ở phù hợp..."):
                     try:
-                        itinerary = ollama_generate_itinerary(prompt_template)
-                        st.session_state.itinerary_output = itinerary
+                        top5, city_center = recommend_top5_from_api(q)
+                        st.session_state.accommodation_results = {
+                            "query": q,
+                            "city_center": city_center,
+                            "results": top5
+                        }
                     except requests.RequestException as e:
-                        st.error(f"Lỗi kết nối với Ollama: {e}. Vui lòng kiểm tra máy chủ LLM.")
-                        st.session_state.itinerary_output = None
+                        st.error(f"Lỗi khi gọi API OpenStreetMap/Overpass: {e}")
+                        st.session_state.accommodation_results = None
 
-                # Tải lại giao diện để hiển thị kết quả
+                # Reload lại để phía dưới dùng session_state hiển thị kết quả
                 st.rerun()
 
-    # --- Kết thúc: Phần nhập liệu Du lịch ---
-    
-    # Khu vực hiển thị lịch trình
-    if "itinerary_output" not in st.session_state:
-        st.session_state.itinerary_output = None
-        
-    st.divider()
-    
-    if st.session_state.itinerary_output:
-        st.markdown("### Lịch Trình Du Lịch Đề Xuất")
-        st.info(st.session_state.itinerary_output)
-    elif submit_button:
-        st.warning("Đang tạo lịch trình... Vui lòng chờ.")
+    # ===== KHU VỰC HIỂN THỊ KẾT QUẢ GỢI Ý NƠI Ở =====
+    results_state = st.session_state.accommodation_results
+
+    if results_state and results_state.get("results"):
+        st.markdown("### 🔝 Top 5 nơi ở được đề xuất")
+
+        for item in results_state["results"]:
+            a = item["accommodation"]
+            score = item["score"]
+
+            st.markdown(f"#### {a.name} ({a.type})")
+            st.write(
+                f"- Thành phố: **{a.city}**  |  Cách trung tâm: ~**{a.distance_km:.2f} km**"
+            )
+            st.write(
+                f"- Giá ước lượng/đêm: **{int(a.price):,} VND**  |  "
+                f"Số sao: **{a.stars}⭐**  |  Rating: **{a.rating:.1f}/10**"
+            )
+            if a.amenities:
+                st.write(f"- Tiện ích: {', '.join(a.amenities)}")
+            else:
+                st.write("- Tiện ích: (không rõ từ OSM)")
+            st.write(f"- Điểm xếp hạng thuật toán: **{score:.3f}**")
+            st.markdown("---")
+
+    elif results_state is not None and results_state.get("results") == []:
+        st.info("Không có nơi ở nào thỏa điều kiện tìm kiếm hiện tại. Hãy thử nới lỏng tiêu chí.")
 else:
+    # Nếu chưa đăng nhập thì vẫn giữ logic cũ: hiển thị form đăng ký / đăng nhập
     if st.session_state.get("show_signup", False):
         signup_form()
     elif st.session_state.get("show_login", True):
         login_form()
 
-st.divider()
+# --- Kết thúc: Phần Gợi ý Nơi Ở ---
+
 st.markdown("<h5 style='text-align: center;'>Click 💬 để mở hộp thoại chat</h5>", unsafe_allow_html=True)
 
 st.markdown('<div id="fab-anchor"></div>', unsafe_allow_html=True)
